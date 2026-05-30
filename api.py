@@ -1,243 +1,263 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+import os
+import streamlit as st
 import pandas as pd
 import numpy as np
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-app = FastAPI(title="Honey Purity Serverless Engine")
+# ============================================================
+# CONFIG & THEME SETUP
+# ============================================================
+st.set_page_config(page_title="Advanced Honey Purity Dashboard", page_icon="🍯", layout="wide")
 
-# Global containers for in-memory ML components
-model = None
-scaler = None
-feature_names = None
-pollen_encoder = None
-pollen_list = []
+MODEL_PATH = "honey_rf_model.pkl"
+SCALER_PATH = "scaler.pkl"
+FEATURES_PATH = "features.pkl"
+CLASSES_PATH = "pollen_classes.pkl"
 
-def train_pipeline_in_memory():
-    global model, scaler, feature_names, pollen_encoder, pollen_list
+# ============================================================
+# AUTONOMOUS PIPELINE / MODEL TRAINING
+# ============================================================
+def run_training_pipeline():
+    """Cleans data, fixes leakage, trains model, and saves artifacts."""
+    if not os.path.exists("honey_purity_dataset.csv"):
+        return False
+        
+    df = pd.read_csv("honey_purity_dataset.csv")
+    df.drop_duplicates(inplace=True)
     
-    try:
-        df = pd.read_csv("honey_purity_dataset.csv")
-    except Exception:
-        # Fallback dummy dataset to ensure Vercel builds successfully if file path shifts
-        data = {
-            'CS': np.random.uniform(1, 10, 100), 'Density': np.random.uniform(1.1, 1.9, 100),
-            'WC': np.random.uniform(12, 25, 100), 'pH': np.random.uniform(3, 8, 100),
-            'EC': np.random.uniform(0.5, 1.5, 100), 'F': np.random.uniform(20, 50, 100),
-            'G': np.random.uniform(20, 50, 100), 'Pollen_analysis': np.random.choice(['Alfalfa', 'Chestnut', 'Borage', 'Acacia'], 100),
-            'Viscosity': np.random.uniform(1000, 15000, 100), 'Purity': np.random.uniform(0.5, 1.0, 100),
-            'Price': np.random.uniform(10, 1000, 100)
-        }
-        df = pd.DataFrame(data)
-
-    df = df.drop_duplicates()
-    
-    # Fill missing values safely
+    # Handle missing values safely
     numeric_columns = df.select_dtypes(include=np.number).columns
     for col in numeric_columns:
         df[col] = df[col].fillna(df[col].mean())
         
-    # Categorical Encoding
-    pollen_encoder = LabelEncoder()
+    # Encode categorical data
+    encoder = LabelEncoder()
     if 'Pollen_analysis' in df.columns:
-        df['Pollen_analysis'] = pollen_encoder.fit_transform(df['Pollen_analysis'].astype(str))
-        pollen_list = list(pollen_encoder.classes_)
-    else:
-        pollen_list = ["Unknown"]
+        df['Pollen_analysis'] = encoder.fit_transform(df['Pollen_analysis'].astype(str))
+        joblib.dump(encoder.classes_, CLASSES_PATH)
         
-    # Create target label (Fixing Data Leakage by dropping 'Purity' out of training feature sets)
+    # Create target label
     if 'Purity' in df.columns:
         df['Purity_Label'] = df['Purity'].apply(lambda x: 1 if x >= 0.75 else 0)
-    else:
-        df['Purity_Label'] = np.random.choice([0, 1], size=len(df))
         
+    # Splitting Features & Targets properly (Fixing Data Leakage)
+    # Note: 'Purity' must be dropped from features so the model doesn't 'cheat'
     X = df.drop(columns=['Purity', 'Purity_Label'], errors='ignore')
     y = df['Purity_Label']
     
-    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     
+    # Feature Scaling after the split to avoid leakage
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
     
-    # Train production model
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train_scaled, y_train)
+    # Train primary production model
+    rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf_model.fit(X_train_scaled, y_train)
     
-    feature_names = X.columns.tolist()
-
-# Train the model layout instantly upon startup
-train_pipeline_in_memory()
-
-# API Input Validations Schema
-class HoneySample(BaseModel):
-    CS: float
-    Density: float
-    WC: float
-    pH: float
-    EC: float
-    F: float
-    G: float
-    Pollen_analysis: str
-    Viscosity: float
-    Price: float
-
-@app.get("/", response_class=HTMLResponse)
-def root():
-    # Build options for HTML UI dropdown
-    options_html = "".join([f"<option value='{p}'>{p}</option>" for p in pollen_list])
+    # Save the pipeline artifacts
+    joblib.dump(rf_model, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    joblib.dump(X.columns.tolist(), FEATURES_PATH)
     
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Honey Purity Analyzer</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <style>
-            body {{ background-color: #fcf8f2; font-family: sans-serif; }}
-            .card {{ box-shadow: 0 4px 15px rgba(0,0,0,0.05); border: none; border-radius: 12px; }}
-            .btn-primary {{ background-color: #d97706; border: none; }}
-            .btn-primary:hover {{ background-color: #b45309; }}
-        </style>
-    </head>
-    <body>
-        <div class="container py-5" style="max-width: 800px;">
-            <div class="text-center mb-4">
-                <h1 class="display-5 fw-bold text-warning-dark" style="color: #b45309;">🍯 Honey Purity Diagnostic Tool</h1>
-                <p class="text-muted">Deployed Serverless on Vercel via FastAPI</p>
-            </div>
-            
-            <div class="card p-4 bg-white mb-4">
-                <h4 class="mb-3 text-secondary">🔬 Chemical Metrics Analysis</h4>
-                <form id="purityForm">
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <label class="form-label">Color Score (CS)</label>
-                            <input type="number" class="form-label form-control" name="CS" step="0.01" value="5.0" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Density (g/cm³)</label>
-                            <input type="number" class="form-label form-control" name="Density" step="0.01" value="1.42" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Water Content (%)</label>
-                            <input type="number" class="form-label form-control" name="WC" step="0.01" value="17.5" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">pH Level</label>
-                            <input type="number" class="form-label form-control" name="pH" step="0.01" value="4.5" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Electrical Conductivity (EC)</label>
-                            <input type="number" class="form-label form-control" name="EC" step="0.01" value="0.78" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Fructose Level</label>
-                            <input type="number" class="form-label form-control" name="F" step="0.01" value="35.2" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Glucose Level</label>
-                            <input type="number" class="form-label form-control" name="G" step="0.01" value="30.1" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Viscosity (mPa·s)</label>
-                            <input type="number" class="form-label form-control" name="Viscosity" value="4500" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Price Index ($)</label>
-                            <input type="number" class="form-label form-control" name="Price" value="550" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Pollen Source Analysis</label>
-                            <select class="form-select" name="Pollen_analysis">
-                                {options_html}
-                            </select>
-                        </div>
-                    </div>
-                    <button type="submit" class="btn btn-primary w-100 mt-4 py-2 fw-bold text-white">Analyze Sample Purity</button>
-                </form>
-            </div>
-            
-            <div id="resultCard" class="card p-4 text-center d-none">
-                <h3 id="resultStatus" class="fw-bold"></h3>
-                <p id="resultConfidence" class="text-muted mb-0"></p>
-            </div>
-        </div>
+    return df, X_test_scaled, y_test, rf_model, scaler, X.columns.tolist()
 
-        <script>
-            document.getElementById('purityForm').addEventListener('submit', async (e) => {{
-                e.preventDefault();
-                const formData = new FormData(e.target);
-                const payload = {{}};
-                formData.forEach((value, key) => {{
-                    payload[key] = (key === 'Pollen_analysis') ? value : parseFloat(value);
-                }});
+# Run/Load the pipeline quietly behind the scenes
+pipeline_success = True
+if not os.path.exists(MODEL_PATH):
+    with st.spinner("Initializing Pipeline & Training Models..."):
+        res = run_training_pipeline()
+        if res is False:
+            pipeline_success = False
 
-                try {{
-                    const response = await fetch('/predict', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify(payload)
-                    }});
-                    const data = await response.json();
-                    
-                    const resultCard = document.getElementById('resultCard');
-                    const resultStatus = document.getElementById('resultStatus');
-                    const resultConfidence = document.getElementById('resultConfidence');
-                    
-                    resultCard.classList.remove('d-none', 'bg-success-subtle', 'bg-danger-subtle');
-                    
-                    if(data.prediction_code === 1) {{
-                        resultCard.classList.add('bg-success-subtle');
-                        resultStatus.innerHTML = "✅ " + data.status;
-                        resultStatus.style.color = "#157347";
-                    }} else {{
-                        resultCard.classList.add('bg-danger-subtle');
-                        resultStatus.innerHTML = "❌ " + data.status;
-                        resultStatus.style.color = "#bb2d3b";
-                    }}
-                    resultConfidence.innerHTML = "Confidence Match Accuracy Score: " + data.confidence_score;
-                }} catch(err) {{
-                    alert("Error running inference calculation model.");
-                }}
-            }});
-        </script>
-    </body>
-    </html>
-    """
+# Load data for visualization metrics if dataset exists
+@st.cache_data
+def load_raw_data():
+    if os.path.exists("honey_purity_dataset.csv"):
+        return pd.read_csv("honey_purity_dataset.csv")
+    return None
 
-@app.post("/predict")
-def predict_purity(sample: HoneySample):
-    try:
-        pollen_str = sample.Pollen_analysis
-        if pollen_str in pollen_encoder.classes_:
-            pollen_encoded = int(np.where(pollen_encoder.classes_ == pollen_str)[0][0])
-        else:
-            pollen_encoded = 0
-            
-        input_data = {
-            'CS': sample.CS, 'Density': sample.Density, 'WC': sample.WC, 'pH': sample.pH, 'EC': sample.EC,
-            'F': sample.F, 'G': sample.G, 'Pollen_analysis': pollen_encoded,
-            'Viscosity': sample.Viscosity, 'Price': sample.Price
-        }
-        
-        input_df = pd.DataFrame([input_data])[feature_names]
+df_raw = load_raw_data()
+
+# ============================================================
+# STREAMLIT UI SIDEBAR & NAVIGATION
+# ============================================================
+st.sidebar.title("🍯 Honey Analytics Hub")
+page = st.sidebar.radio("Navigate Project", ["Real-time Predictor", "Model Analytics", "Dataset Exploratory (EDA)"])
+
+if not pipeline_success or df_raw is None:
+    st.error("⚠️ `honey_purity_dataset.csv` not found! Place your dataset in the root directory to run analytics.")
+    st.stop()
+
+# Load necessary production artifacts
+model = joblib.load(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
+feature_names = joblib.load(FEATURES_PATH)
+pollen_classes = joblib.load(CLASSES_PATH)
+
+# ============================================================
+# PAGE 1: REAL-TIME PREDICTION INDEX
+# ============================================================
+if page == "Real-time Predictor":
+    st.title("🔬 Production Purity Diagnostic Tool")
+    st.write("Input a honey sample's chemical profile parameters to evaluate purity instantly.")
+    
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        cs = st.slider("Color Score (CS)", 1.0, 10.0, 5.0, step=0.1)
+        density = st.slider("Density (g/cm³)", 1.1, 1.9, 1.4, step=0.01)
+        wc = st.slider("Water Content (%)", 12.0, 25.0, 18.0, step=0.1)
+        ph = st.slider("pH Level", 3.0, 8.0, 4.5, step=0.1)
+        ec = st.slider("Electrical Conductivity (EC)", 0.5, 1.5, 0.8, step=0.01)
+
+    with col2:
+        fructose = st.slider("Fructose Level", 20.0, 50.0, 35.0, step=0.1)
+        glucose = st.slider("Glucose Level", 20.0, 50.0, 30.0, step=0.1)
+        viscosity = st.number_input("Viscosity (mPa·s)", min_value=1000.0, max_value=15000.0, value=4500.0)
+        price = st.number_input("Price Index ($)", min_value=10.0, max_value=2000.0, value=500.0)
+        pollen_type = st.selectbox("Pollen Analysis Source", options=pollen_classes)
+
+    pollen_encoded = np.where(pollen_classes == pollen_type)[0][0]
+
+    # Map exact order of keys trained during fit mapping
+    input_data = {
+        'CS': cs, 'Density': density, 'WC': wc, 'pH': ph, 'EC': ec,
+        'F': fructose, 'G': glucose, 'Pollen_analysis': pollen_encoded,
+        'Viscosity': viscosity, 'Price': price
+    }
+    
+    # Process inputs exactly like training data structure
+    input_df = pd.DataFrame([input_data])[feature_names]
+    
+    st.markdown("###")
+    if st.button("Run Diagnostics Matrix", type="primary", use_container_width=True):
         scaled_input = scaler.transform(input_df)
-        
-        prediction = int(model.predict(scaled_input)[0])
+        prediction = model.predict(scaled_input)[0]
         probabilities = model.predict_proba(scaled_input)[0]
         
-        status = "THE HONEY SAMPLE IS PURE" if prediction == 1 else "THE HONEY SAMPLE IS ADULTERATED / IMPURE"
-        confidence = float(probabilities[1] if prediction == 1 else probabilities[0])
+        st.markdown("---")
+        if prediction == 1:
+            st.success(f"### ✅ Result: The Honey Sample is PURE! (Confidence: {probabilities[1]*100:.2f}%)")
+        else:
+            st.error(f"### ❌ Result: The Honey Sample is IMPURE / ADULTERATED! (Confidence: {probabilities[0]*100:.2f}%)")
+
+# ============================================================
+# PAGE 2: MODEL PERFORMANCE ANALYTICS
+# ============================================================
+elif page == "Model Analytics":
+    st.title("📊 Pipeline & Algorithm Analytics Comparison")
+    
+    # Run dynamic performance comparison safely isolated from data leakage
+    df_clean = df_raw.copy().drop_duplicates()
+    if 'Pollen_analysis' in df_clean.columns:
+        df_clean['Pollen_analysis'] = LabelEncoder().fit_transform(df_clean['Pollen_analysis'].astype(str))
+    if 'Purity' in df_clean.columns:
+        df_clean['Purity_Label'] = df_clean['Purity'].apply(lambda x: 1 if x >= 0.75 else 0)
         
-        return {
-            "prediction_code": prediction,
-            "status": status,
-            "confidence_score": f"{confidence * 100:.2f}%"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-   
+    X_unscaled = df_clean.drop(columns=['Purity', 'Purity_Label'], errors='ignore')
+    y_target = df_clean['Purity_Label']
+    
+    X_tr, X_te, y_tr, y_te = train_test_split(X_unscaled, y_target, test_size=0.2, random_state=42, stratify=y_target)
+    
+    sc = StandardScaler()
+    X_tr_sc = sc.fit_transform(X_tr)
+    X_te_sc = sc.transform(X_te)
+    
+    # Models benchmarking
+    models = {
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+        "Decision Tree": DecisionTreeClassifier(random_state=42),
+        "KNN Classifier": KNeighborsClassifier(n_neighbors=5)
+    }
+    
+    accuracies = {}
+    reports = {}
+    cms = {}
+    
+    for name, clf in models.items():
+        clf.fit(X_tr_sc, y_tr)
+        preds = clf.predict(X_te_sc)
+        accuracies[name] = accuracy_score(y_te, preds)
+        reports[name] = classification_report(y_te, preds, output_dict=True)
+        cms[name] = confusion_matrix(y_te, preds)
+        
+    # UI Layout columns
+    m_col1, m_col2 = st.columns([1, 1])
+    
+    with m_col1:
+        st.subheader("Model Benchmark Accuracy Comparison")
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        sns.barplot(x=list(accuracies.keys()), y=list(accuracies.values()), ax=ax, palette="Blues_r")
+        ax.set_ylabel("Accuracy Score")
+        ax.set_ylim(0, 1.05)
+        for i, v in enumerate(accuracies.values()):
+            ax.text(i, v + 0.02, f"{v*100:.2f}%", ha='center', fontweight='bold')
+        st.pyplot(fig)
+
+    with m_col2:
+        st.subheader("Confusion Matrix (Production RF Model)")
+        fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
+        sns.heatmap(cms["Random Forest"], annot=True, fmt='d', cmap='Oranges', cbar=False,
+                    xticklabels=['Impure', 'Pure'], yticklabels=['Impure', 'Pure'], ax=ax_cm)
+        ax_cm.set_xlabel("Predicted Label")
+        ax_cm.set_ylabel("True Label")
+        st.pyplot(fig_cm)
+        
+    st.markdown("---")
+    st.subheader("Feature Importances Breakdown")
+    rf_prod = models["Random Forest"]
+    importance_df = pd.DataFrame({
+        'Feature': X_unscaled.columns,
+        'Importance': rf_prod.feature_importances_
+    }).sort_values(by='Importance', ascending=False)
+    
+    fig_imp, ax_imp = plt.subplots(figsize=(10, 4))
+    sns.barplot(data=importance_df, x='Importance', y='Feature', palette='viridis', ax=ax_imp)
+    st.pyplot(fig_imp)
+
+# ============================================================
+# PAGE 3: EXPLORATORY DATA ANALYSIS (EDA)
+# ============================================================
+elif page == "Dataset Exploratory (EDA)":
+    st.title("📈 Exploratory Insights & Data Distributions")
+    
+    st.subheader("Statistical Glimpse")
+    st.dataframe(df_raw.describe(), use_container_width=True)
+    
+    st.markdown("---")
+    eda_col1, eda_col2 = st.columns(2)
+    
+    with eda_col1:
+        st.subheader("Target Balanced Distribution")
+        if 'Purity' in df_raw.columns:
+            labels_purity = df_raw['Purity'].apply(lambda x: 'Pure (>=0.75)' if x >= 0.75 else 'Impure (<0.75)').value_counts()
+            fig, ax = plt.subplots(figsize=(5, 5))
+            ax.pie(labels_purity, labels=labels_purity.index, autopct='%1.1f%%', colors=['#ffcc5c', '#ff6f69'], startangle=90)
+            st.pyplot(fig)
+            
+    with eda_col2:
+        st.subheader("Correlation Heatmap Matrix")
+        numeric_df = df_raw.select_dtypes(include=np.number)
+        fig, ax = plt.subplots(figsize=(7, 5.5))
+        sns.heatmap(numeric_df.corr(), annot=False, cmap='coolwarm', ax=ax)
+        st.pyplot(fig)
+        
+    st.markdown("---")
+    st.subheader("Feature Variable Distribution Inspector")
+    selected_col = st.selectbox("Choose feature parameter to visualize distribution trend:", options=df_raw.select_dtypes(include=np.number).columns)
+    
+    fig_dist, ax_dist = plt.subplots(figsize=(10, 4))
+    sns.histplot(df_raw[selected_col], kde=True, color='orange', ax=ax_dist)
+    st.pyplot(fig_dist)
